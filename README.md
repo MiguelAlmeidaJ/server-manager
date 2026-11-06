@@ -88,6 +88,18 @@ Se o PM2 já estiver ativo, prefira `pm2 restart ecosystem.config.cjs --update-e
 
 Verifique `pm2 logs servermap-api --lines 50` e `pm2 logs servermap-web --lines 50` se o status estiver online mas o endpoint falhar. O PM2 em estado `online` **não** substitui build bem-sucedido e teste HTTP.
 
+
+## Edição e portas vinculadas (beta)
+
+- Na aba **Servidores**, use **Editar** para alterar nome, IP, sistema operacional e ambiente.
+- Na aba **Aplicações**, use **Editar** para alterar servidor, nome, stack e domínio.
+- Ao editar uma aplicação, a seção **Portas da aplicação** permite incluir, alterar e remover várias reservas TCP/UDP com endereço de bind.
+- A tabela de aplicações mostra as portas reservadas para cada uma; a aba **Portas** mostra a aplicação vinculada e também permite criar reservas avulsas ou vinculadas.
+- Ao trocar o servidor de uma aplicação com portas vinculadas, remova ou libere primeiro as reservas antigas para evitar associar portas ao servidor errado.
+- Conflitos de reservas são verificados por servidor, porta, protocolo e endereço de bind. **Não há detecção automática de portas já ocupadas no host**.
+
+Novas rotas: `PUT /api/servers/:id`, `PUT /api/applications/:id` e `PUT /api/ports/reservations/:id`.
+
 ## API e limitações
 
 `GET /api/health` é público. Os demais endpoints exigem `Authorization: Bearer ADMIN_API_TOKEN`.

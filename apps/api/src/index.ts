@@ -44,9 +44,30 @@ const overlaps=(a:string,b:string)=>a===b||['0.0.0.0','::','*'].includes(a)||['0
 app.get('/api/health',async()=>({status:'ok'}));
 app.get('/api/servers',async()=>sql`SELECT id,name,ip_address AS "ipAddress",os,environment,created_at AS "createdAt" FROM servers ORDER BY name`);
 app.post('/api/servers',async req=>{const s=serverSchema.parse(req.body);const rows=await sql`INSERT INTO servers(name,ip_address,os,environment) VALUES(${s.name},${s.ipAddress},${s.os},${s.environment}) RETURNING *`;return rows[0]});
+app.put('/api/servers/:id',async(req,reply)=>{
+ const {id:serverId}=z.object({id}).parse(req.params);
+ const s=serverSchema.parse(req.body);
+ const rows=await sql`UPDATE servers SET name=${s.name},ip_address=${s.ipAddress},os=${s.os},environment=${s.environment} WHERE id=${serverId} RETURNING id,name,ip_address AS "ipAddress",os,environment`;
+ return rows.length?rows[0]:reply.code(404).send({error:'Server not found'});
+});
 app.delete('/api/servers/:id',async(req,reply)=>{const {id:serverId}=z.object({id}).parse(req.params);const rows=await sql`DELETE FROM servers WHERE id=${serverId} RETURNING id`;return rows.length?{deleted:true}:reply.code(404).send({error:'Not found'})});
 app.get('/api/applications',async()=>sql`SELECT id,server_id AS "serverId",name,technology,domain FROM applications ORDER BY name`);
 app.post('/api/applications',async req=>{const a=applicationSchema.parse(req.body);const rows=await sql`INSERT INTO applications(server_id,name,technology,domain) VALUES(${a.serverId},${a.name},${a.technology??null},${a.domain??null}) RETURNING *`;return rows[0]});
+app.put('/api/applications/:id',async(req,reply)=>{
+ const {id:appId}=z.object({id}).parse(req.params);
+ const a=applicationSchema.parse(req.body);
+ const result=await sql.begin(async tx=>{
+   const existing=await tx`SELECT id,server_id FROM applications WHERE id=${appId} FOR UPDATE`;
+   if(!existing.length)return {status:404,error:'Application not found'};
+   if(existing[0].server_id!==a.serverId){
+     const attached=await tx`SELECT id FROM port_reservations WHERE application_id=${appId} LIMIT 1`;
+     if(attached.length)return {status:409,error:'Remove application port reservations before changing its server'};
+   }
+   const rows=await tx`UPDATE applications SET server_id=${a.serverId},name=${a.name},technology=${a.technology??null},domain=${a.domain??null} WHERE id=${appId} RETURNING id,server_id AS "serverId",name,technology,domain`;
+   return {status:200,data:rows[0]};
+ });
+ return 'error' in result?reply.code(result.status).send({error:result.error}):result.data;
+});
 app.delete('/api/applications/:id',async(req,reply)=>{const {id:appId}=z.object({id}).parse(req.params);const rows=await sql`DELETE FROM applications WHERE id=${appId} RETURNING id`;return rows.length?{deleted:true}:reply.code(404).send({error:'Not found'})});
 app.get('/api/ports/reservations',async()=>sql`SELECT id,server_id AS "serverId",application_id AS "applicationId",port,protocol,bind_address AS "bindAddress" FROM port_reservations ORDER BY port`);
 app.post('/api/ports/suggest',async(req,reply)=>{
@@ -57,16 +78,39 @@ app.post('/api/ports/suggest',async(req,reply)=>{
  for(let port=q.start;port<=q.end;port++){if(!used.some(p=>p.port===port&&overlaps(p.bind_address,q.bindAddress))){chosen=port;break}}
  return {port:chosen,source:'reservations-only',warning:'Live sockets are not checked'};
 });
+app.put('/api/ports/reservations/:id',async(req,reply)=>{
+ const {id:reservationId}=z.object({id}).parse(req.params);
+ const r=reservationSchema.parse(req.body);
+ const result=await sql.begin(async tx=>{
+   const old=await tx`SELECT id,application_id FROM port_reservations WHERE id=${reservationId} FOR UPDATE`;
+   if(!old.length)return {status:404,error:'Reservation not found'};
+   const lockKeys=[r.serverId+':'+r.protocol+':'+r.port];
+   for(const key of lockKeys)await tx`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
+   if(r.applicationId){
+     const appServer=await tx`SELECT server_id FROM applications WHERE id=${r.applicationId}`;
+     if(!appServer.length||appServer[0].server_id!==r.serverId)return {status:400,error:'Application must belong to the selected server'};
+   }
+   const others=await tx`SELECT bind_address FROM port_reservations WHERE server_id=${r.serverId} AND protocol=${r.protocol} AND port=${r.port} AND id<>${reservationId}`;
+   if(others.some(p=>overlaps(p.bind_address,r.bindAddress)))return {status:409,error:'Port already reserved on this server'};
+   const rows=await tx`UPDATE port_reservations SET server_id=${r.serverId},application_id=${r.applicationId??null},port=${r.port},protocol=${r.protocol},bind_address=${r.bindAddress} WHERE id=${reservationId} RETURNING id,server_id AS "serverId",application_id AS "applicationId",port,protocol,bind_address AS "bindAddress"`;
+   return {status:200,data:rows[0]};
+ });
+ return 'error' in result?reply.code(result.status).send({error:result.error}):result.data;
+});
 app.post('/api/ports/reservations',async(req,reply)=>{
  const r=reservationSchema.parse(req.body);
  const result=await sql.begin(async tx=>{
+   if(r.applicationId){
+     const existingApplication=await tx`SELECT server_id FROM applications WHERE id=${r.applicationId}`;
+     if(!existingApplication.length||existingApplication[0].server_id!==r.serverId)return {error:'Application must belong to the selected server',status:400};
+   }
    await tx`SELECT pg_advisory_xact_lock(hashtext(${r.serverId+':'+r.protocol+':'+r.port}))`;
    const existing=await tx`SELECT bind_address FROM port_reservations WHERE server_id=${r.serverId} AND protocol=${r.protocol} AND port=${r.port}`;
    if(existing.some(p=>overlaps(p.bind_address,r.bindAddress)))return null;
    const rows=await tx`INSERT INTO port_reservations(server_id,application_id,port,protocol,bind_address) VALUES(${r.serverId},${r.applicationId??null},${r.port},${r.protocol},${r.bindAddress}) RETURNING *`;
    return rows[0];
  });
- return result?reply.code(201).send(result):reply.code(409).send({error:'Port reservation conflicts'});
+ return result && 'error' in result?reply.code(result.status).send({error:result.error}):result?reply.code(201).send(result):reply.code(409).send({error:'Port reservation conflicts'});
 });
 app.delete('/api/ports/reservations/:id',async(req,reply)=>{const {id:reservationId}=z.object({id}).parse(req.params);const rows=await sql`DELETE FROM port_reservations WHERE id=${reservationId} RETURNING id`;return rows.length?{deleted:true}:reply.code(404).send({error:'Not found'})});
 await app.listen({host:process.env.HOST??'127.0.0.1',port:Number(process.env.PORT??3333)});
