@@ -1,16 +1,20 @@
 # ServerMap (beta)
 
-Inventário manual de servidores/aplicações e reserva de portas. Frontend React + Vite, backend Fastify, PostgreSQL em Docker; API e frontend são processos Node gerenciados pelo **PM2**.
+Painel privado de inventário manual de servidores, aplicações e reservas de portas.
 
-## Portas
+## Arquitetura
 
-| Serviço | Host | Observação |
-| --- | --- | --- |
-| PostgreSQL | `127.0.0.1:5434` | Docker mapeia para porta 5432 no container |
-| API | `127.0.0.1:3333` | PM2: servermap-api |
-| Web | `127.0.0.1:8080` | PM2: servermap-web; proxy de `/api` |
+- **Web:** React/Vite (compilado), servidor HTTP Node.js sob `pm2-runtime`, em container Docker.
+- **API:** Fastify sob `pm2-runtime`, em outro container Docker.
+- **PostgreSQL:** container Docker isolado, sem portas publicadas no host.
+- **Rede `application`:** somente web e API.
+- **Rede `database`:** somente API e PostgreSQL, com `internal: true`.
 
-## Instalação (Linux com Node.js 22+, Docker e pnpm)
+A Web é o único serviço publicado no host, em **`127.0.0.1:8080`**. A API atende em `api:3333` e o PostgreSQL em `postgres:5432`, usando nomes DNS internos do Docker. **Não é necessário publicar 5434 nem 5432 no host.**
+
+## Primeira execução
+
+Requisitos: Docker Engine e Docker Compose.
 
 ```bash
 git clone -b beta https://github.com/MiguelAlmeidaJ/server-manager.git
@@ -18,59 +22,54 @@ cd server-manager
 cp .env.example .env
 ```
 
-Edite `.env`: altere `POSTGRES_PASSWORD`, coloque a **mesma senha** no campo de senha de `DATABASE_URL`, e gere um `ADMIN_API_TOKEN` longo e aleatório (32+ caracteres). Se a senha tiver caracteres especiais, use URL encoding em `DATABASE_URL`. Não versione o `.env`.
+Edite `.env`, substitua `POSTGRES_PASSWORD` por uma senha forte compatível com URI (ou seja, use caracteres não reservados), e configure `ADMIN_API_TOKEN` com uma string aleatória de 32+ caracteres. Mantenha `.env` fora do Git.
 
 ```bash
-docker compose up -d postgres
-corepack enable
-pnpm install
-pnpm build
-npm install -g pm2
-pm2 start ecosystem.config.cjs
-pm2 status
+docker compose up -d --build
+docker compose ps
+docker compose logs -f api web
 ```
 
-Acesse `http://127.0.0.1:8080` na máquina do processo, informe o token. Para acesso remoto, use túnel SSH:
+Abra `http://127.0.0.1:8080` na máquina que executa o Docker. Para acesso remoto via SSH:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 usuario@seu-servidor
+ssh -L 8080:127.0.0.1:8080 usuario@servidor
 ```
 
-Se já usava a versão anterior com containers web e api:
+**Ambos web e API usam PM2 dentro de seus containers**. Para inspecionar:
 
 ```bash
-docker compose stop web api
-docker compose rm -f web api
-docker compose up -d postgres
+docker compose exec web pm2 list
+docker compose exec api pm2 list
+docker compose logs -f web api
 ```
 
-A alteração para a porta 5434 só afeta a porta publicada no host. O PostgreSQL continua na 5432 interna do container.
+Use `docker compose restart web api` para reiniciar e `docker compose up -d --build` para atualizar. Não é necessário instalar PM2 globalmente no host.
 
-## Operação PM2
+## Migração da versão anterior (PM2 no host + banco publicado)
+
+Se os processos antigos estiverem ativos no host, pare-os **antes** de subir a versão nova:
 
 ```bash
-pm2 logs servermap-api
-pm2 logs servermap-web
-pm2 restart ecosystem.config.cjs --update-env
+pm2 delete servermap-web servermap-api
 pm2 save
 ```
 
-Para configurar inicialização no boot, rode `pm2 startup` e execute o comando que ele imprimir, depois `pm2 save`. Execute PM2 com um usuário dedicado, sem privilégios de root sempre que possível.
+Depois execute `docker compose up -d --build`. A alteração remove o mapeamento de porta do banco, mas preserva o volume nomeado `pgdata`. **Não execute `docker compose down -v`**, pois isso apaga os dados do volume. Se o volume for antigo, mantenha a senha já configurada ou faça uma alteração de senha apropriada no PostgreSQL.
 
 ## API
 
-`GET /api/health` é público. Outros endpoints requerem `Authorization: Bearer ADMIN_API_TOKEN`.
+`GET /api/health` é público. As outras rotas exigem `Authorization: Bearer ADMIN_API_TOKEN`.
 
-`GET/POST /api/servers`, `DELETE /api/servers/:id`;
-`GET/POST /api/applications`, `DELETE /api/applications/:id`;
-`GET /api/ports/reservations`, `POST /api/ports/suggest`, `POST /api/ports/reservations`, `DELETE /api/ports/reservations/:id`.
+- `GET/POST /api/servers`; `DELETE /api/servers/:id`
+- `GET/POST /api/applications`; `DELETE /api/applications/:id`
+- `GET /api/ports/reservations`
+- `POST /api/ports/suggest`; `POST /api/ports/reservations`; `DELETE /api/ports/reservations/:id`
 
-## Segurança e limitações
+## Limitações e segurança
 
-Não exponha o painel publicamente neste estágio: usa um token administrativo único e provisório. Os serviços ficam vinculados a localhost por padrão.
+O login atual usa um token administrativo único provisório. **Não exponha o MVP diretamente à internet**. O bind do host fica limitado a localhost; caso precise acesso remoto, use túnel SSH ou proxy HTTPS autenticado.
 
-Reservas são protegidas por bloqueio transacional no PostgreSQL, mas sugestões consultam **somente reservas cadastradas**, não portas em uso no sistema operacional. Agentes Windows/Linux, Docker discovery, autenticação individual, RBAC e auditoria serão implementados depois.
+O gerenciamento de portas considera somente reservas registradas na aplicação; ainda não consulta sockets ou containers reais. Coleta Linux/Windows, autenticação individual, auditoria e detecção automática serão implementadas depois.
 
-## Desenvolvimento local
-
-`pnpm dev` continua disponível; exige `DATABASE_URL` e `ADMIN_API_TOKEN` definidos no shell e banco ligado. O arquivo `.env` não é carregado automaticamente fora do PM2.
+A configuração antiga de PM2 no host foi substituída pelo `pm2-runtime` dentro dos containers. O arquivo `ecosystem.config.cjs` legado não faz mais parte do modo de execução suportado.
