@@ -1,0 +1,41 @@
+// PM2 configuration. Run from repository root after copying and editing .env.
+const { loadEnvFile } = require('node:process');
+const path = require('node:path');
+const root = __dirname;
+loadEnvFile(path.join(root, '.env'));
+
+module.exports = {
+  apps: [
+    {
+      name: 'servermap-api',
+      cwd: root,
+      script: 'apps/api/dist/index.js',
+      exec_mode: 'fork',
+      instances: 1,
+      autorestart: true,
+      max_memory_restart: '512M',
+      env: {
+        NODE_ENV: 'production',
+        HOST: '127.0.0.1',
+        PORT: process.env.API_PORT || '3333',
+        DATABASE_URL: process.env.DATABASE_URL,
+        ADMIN_API_TOKEN: process.env.ADMIN_API_TOKEN,
+      },
+    },
+    {
+      name: 'servermap-web',
+      cwd: root,
+      script: 'apps/web/server.mjs',
+      exec_mode: 'fork',
+      instances: 1,
+      autorestart: true,
+      max_memory_restart: '256M',
+      env: {
+        NODE_ENV: 'production',
+        HOST: '127.0.0.1',
+        PORT: process.env.WEB_PORT || '8080',
+        API_ORIGIN: 'http://127.0.0.1:' + (process.env.API_PORT || '3333'),
+      },
+    },
+  ],
+};
