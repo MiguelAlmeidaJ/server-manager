@@ -19,7 +19,7 @@ module.exports = {
         HOST: '127.0.0.1',
         PORT: process.env.API_PORT || '3333',
         DATABASE_URL: process.env.DATABASE_URL,
-        ADMIN_API_TOKEN: process.env.ADMIN_API_TOKEN,
+        COOKIE_SECURE: process.env.COOKIE_SECURE || 'false',
       },
     },
     {

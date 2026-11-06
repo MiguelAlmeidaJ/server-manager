@@ -2,10 +2,11 @@ import Fastify from 'fastify';
 import postgres from 'postgres';
 import { z, ZodError } from 'zod';
 import { timingSafeEqual, randomBytes, createHash } from 'node:crypto';
+import { hashPassword, verifyPassword, digestSession, createSessionToken, cookieValue, sessionCookie, clearSessionCookie, normalizeUsername, SESSION_DAYS } from './auth.js';
 
-const secret = process.env.ADMIN_API_TOKEN;
 const url = process.env.DATABASE_URL;
-if (!secret || secret.length < 32 || !url) throw new Error('Set ADMIN_API_TOKEN (32+ chars) and DATABASE_URL');
+if (!url) throw new Error('Set DATABASE_URL');
+const cookieSecure = process.env.COOKIE_SECURE === 'true';
 const sql = postgres(url);
 const app = Fastify({ logger: true });
 
@@ -28,12 +29,98 @@ await sql`CREATE TABLE IF NOT EXISTS server_agent_credentials (server_id uuid PR
 await sql`CREATE TABLE IF NOT EXISTS server_scan_status (server_id uuid PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE, scanned_at timestamptz NOT NULL, hostname text, observation_count integer NOT NULL DEFAULT 0)`;
 await sql`CREATE TABLE IF NOT EXISTS observed_ports (server_id uuid NOT NULL REFERENCES servers(id) ON DELETE CASCADE, port integer NOT NULL CHECK(port BETWEEN 1 AND 65535), protocol text NOT NULL CHECK(protocol IN ('tcp','udp')), bind_address text NOT NULL, pid integer, process_name text, state text, scanned_at timestamptz NOT NULL, PRIMARY KEY(server_id,port,protocol,bind_address))`;
 
-app.addHook('onRequest', async (req,reply)=>{
- if(req.url==='/api/agents/report' && req.method==='POST')return;
- if(req.url==='/api/health')return;
- const input=Buffer.from(req.headers.authorization?.replace(/^Bearer /,'')??'');
- const valid=Buffer.from(secret);
- if(input.length!==valid.length||!timingSafeEqual(input,valid))return reply.code(401).send({error:'Unauthorized'});
+await sql`CREATE TABLE IF NOT EXISTS users (
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+ username varchar(50) NOT NULL UNIQUE,
+ password_hash text NOT NULL,
+ role varchar(20) NOT NULL DEFAULT 'admin',
+ is_active boolean NOT NULL DEFAULT true,
+ created_at timestamptz NOT NULL DEFAULT now()
+)`;
+await sql`CREATE TABLE IF NOT EXISTS user_sessions (
+ token_hash text PRIMARY KEY,
+ user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ expires_at timestamptz NOT NULL,
+ created_at timestamptz NOT NULL DEFAULT now()
+)`;
+await sql`CREATE INDEX IF NOT EXISTS user_sessions_expires_idx ON user_sessions(expires_at)`;
+
+type SessionUser = { id: string; username: string; role: string };
+const publicRoutes = new Set(['/api/health','/api/auth/login']);
+const badMethods = new Set(['POST','PUT','PATCH','DELETE']);
+const failedLogins = new Map<string, { attempts: number; until: number }>();
+const dummyHash = await hashPassword(randomBytes(24).toString('hex'));
+function sourceAllowed(origin: string | undefined, host: string | undefined): boolean {
+  if (!origin) return true; // Non-browser tools; cross-site browser requests are blocked by custom header.
+  if (!host) return false;
+  try {
+    const parsed = new URL(origin);
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.host === host;
+  } catch { return false; }
+}
+
+app.addHook('onRequest', async (req, reply) => {
+  if (req.url === '/api/agents/report' && req.method === 'POST') return;
+  if (req.method === 'OPTIONS') return reply.code(405).send({ error: 'Method not allowed' });
+  // SameSite=Strict cookie, origin validation and a non-simple header for mutations.
+  if (badMethods.has(req.method)) {
+    if (req.headers['x-servermap-request'] !== '1') return reply.code(403).send({ error: 'Invalid request' });
+    if (!sourceAllowed(req.headers.origin, req.headers.host)) return reply.code(403).send({ error: 'Cross-site request blocked' });
+  }
+  if (publicRoutes.has(req.url)) return;
+  const rawCookie = cookieValue(req.headers.cookie);
+  if (!rawCookie) return reply.code(401).send({ error: 'Authentication required' });
+  const records = await sql`SELECT u.id, u.username, u.role
+    FROM user_sessions s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.token_hash = ${digestSession(rawCookie)}
+      AND s.expires_at > now() AND u.is_active = true
+    LIMIT 1`;
+  if (!records.length) return reply.code(401).send({ error: 'Session expired or invalid' });
+  (req as typeof req & { sessionUser: SessionUser }).sessionUser =
+    { id: String(records[0].id), username: String(records[0].username), role: String(records[0].role) };
+});
+const loginInput = z.object({
+  username: z.string().trim().min(3).max(50),
+  password: z.string().min(1).max(256)
+});
+app.post('/api/auth/login', async (req, reply) => {
+  const { username, password } = loginInput.parse(req.body);
+  const normalized = normalizeUsername(username);
+  const key = normalized + ':' + req.ip;
+  const now = Date.now();
+  // Short-lived in-process limiter for local MVP. Replace with shared rate-limiting if scaled.
+  if (failedLogins.size > 10000) failedLogins.clear();
+  const entry = failedLogins.get(key);
+  if (entry && entry.until > now && entry.attempts >= 5)
+    return reply.code(429).send({ error: 'Too many login attempts. Try again later.' });
+  const rows = await sql`SELECT id,username,role,password_hash
+    FROM users WHERE username = ${normalized} AND is_active = true LIMIT 1`;
+  const candidate = rows.length ? String(rows[0].password_hash) : dummyHash;
+  const valid = await verifyPassword(password, candidate);
+  if (!rows.length || !valid) {
+    const active = entry && entry.until > now ? entry.attempts : 0;
+    failedLogins.set(key, { attempts: active + 1, until: now + 15 * 60_000 });
+    return reply.code(401).send({ error: 'Invalid username or password' });
+  }
+  failedLogins.delete(key);
+  await sql`DELETE FROM user_sessions WHERE expires_at <= now()`;
+  const rawSession = createSessionToken();
+  await sql`INSERT INTO user_sessions(token_hash,user_id,expires_at)
+    VALUES(${digestSession(rawSession)},${rows[0].id}, now() + (${SESSION_DAYS} * interval '1 day'))`;
+  reply.header('Set-Cookie', sessionCookie(rawSession, cookieSecure));
+  reply.header('Cache-Control', 'no-store');
+  return { user: { id: rows[0].id, username: rows[0].username, role: rows[0].role } };
+});
+app.get('/api/auth/me', async (req) => {
+  return { user: (req as typeof req & { sessionUser: SessionUser }).sessionUser };
+});
+app.post('/api/auth/logout', async (req, reply) => {
+  const raw = cookieValue(req.headers.cookie);
+  if (raw) await sql`DELETE FROM user_sessions WHERE token_hash = ${digestSession(raw)}`;
+  reply.header('Set-Cookie', clearSessionCookie(cookieSecure));
+  reply.header('Cache-Control', 'no-store');
+  return { success: true };
 });
 app.setErrorHandler((err,_req,reply)=>{
  if(err instanceof ZodError)return reply.code(400).send({error:'Validation failed',details:err.flatten()});

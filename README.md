@@ -24,7 +24,7 @@ cd server-manager
 cp .env.example .env
 ```
 
-Edite `.env`: substitua `POSTGRES_PASSWORD` e use a mesma senha na URL de `DATABASE_URL`. Se a senha tiver caracteres reservados, aplique URL encoding na parte da senha. Configure `ADMIN_API_TOKEN` aleatório, com pelo menos 32 caracteres. Não faça commit de `.env`.
+Edite `.env`: substitua `POSTGRES_PASSWORD` e use a mesma senha na URL de `DATABASE_URL`. Se a senha tiver caracteres reservados, aplique URL encoding na parte da senha. Crie o primeiro usuário administrador conforme a seção de autenticação abaixo. Não faça commit de `.env`.
 
 ```bash
 docker compose up -d postgres
@@ -36,7 +36,7 @@ pm2 start ecosystem.config.cjs
 pm2 status
 ```
 
-Acesse `http://127.0.0.1:8080` localmente e informe o token. Para acessar remotamente, use `ssh -L 8080:127.0.0.1:8080 usuario@servidor`.
+Acesse `http://127.0.0.1:8080` localmente e faça login com o usuário e a senha criados. Para acessar remotamente, use `ssh -L 8080:127.0.0.1:8080 usuario@servidor`.
 
 ### Se vier da versão anterior
 
@@ -130,13 +130,63 @@ Confira as instruções de build, segurança, instalação, atualização e remo
 
 O PostgreSQL **continua no Docker** do ServerMap; web e API **continuam no PM2 do host**. O agente é um serviço separado para cada servidor monitorado.
 
+## Autenticação por usuário e senha (beta)
+
+O antigo token administrativo usado no navegador foi **substituído** por login com usuário e senha. O acesso ao painel exige sessão autenticada, guardada em cookie HttpOnly + SameSite=Strict; as sessões são persistidas em PostgreSQL com hash SHA-256 do token, expiram após 7 dias e são revogadas ao sair. Senhas são armazenadas com scrypt e salt aleatório. As credenciais dos agentes (`X-Agent-Token`) continuam separadas e não precisam ser alteradas.
+
+### Criar o primeiro administrador
+
+**Antes da atualização da web, crie um usuário**: após `git pull`, `pnpm install` e `pnpm build`, reinicie a API pelo menos uma vez para criar as tabelas. Em seguida, crie o usuário usando o comando abaixo, em PowerShell na raiz do projeto:
+
+```powershell
+$secure = Read-Host "Defina uma senha de 12 a 256 caracteres" -AsSecureString
+$env:SERVERMAP_ADMIN_PASSWORD = [System.Net.NetworkCredential]::new("", $secure).Password
+node --env-file=.env apps/api/dist/admin.js admin
+Remove-Item Env:SERVERMAP_ADMIN_PASSWORD
+```
+
+**Troque `admin` pelo nome desejado**, usando 3 a 50 caracteres (letras minúsculas, números, ponto, sublinhado ou hífen). O mesmo comando atualiza a senha de um usuário existente e encerra suas sessões. Não digite senhas diretamente na linha de comando nem coloque no Git.
+
+No Linux, use entrada oculta e variável apenas durante o comando:
+
+```bash
+read -r -s -p 'Senha do admin: ' SERVERMAP_ADMIN_PASSWORD; echo
+export SERVERMAP_ADMIN_PASSWORD
+node --env-file=.env apps/api/dist/admin.js admin
+unset SERVERMAP_ADMIN_PASSWORD
+```
+
+Após iniciar sessão, o login permanece válido ao atualizar a página. O botão **Sair** revoga a sessão no banco. O painel não oferece cadastro público de usuários: a criação/alteração de contas é realizada pelo administrador no host.
+
+### Atualizar o ambiente Windows (mantendo o banco existente)
+
+```powershell
+git checkout beta
+git pull origin beta
+pnpm install
+pnpm build
+pm2 restart ecosystem.config.cjs --update-env
+# Criar primeiro admin usando o comando acima
+pm2 save
+```
+
+Não recrie o banco e não execute `docker compose down -v`. Os cadastros de servidores, aplicações, reservas e credenciais dos agentes são preservados.
+
+### HTTPS / Segurança
+
+O painel continua disponível em `127.0.0.1:8080` por padrão. Use túnel SSH ou proxy HTTPS autenticado para acesso remoto. Se o usuário acessar o painel via endereço HTTPS, configure **`COOKIE_SECURE=true`** no arquivo `.env` e reinicie a API para impedir o envio do cookie em HTTP. Em desenvolvimento local HTTP, deixe `false`. Essa opção não ativa HTTPS por si só.
+
+As requisições de escrita do navegador exigem cabeçalho `X-ServerMap-Request: 1` e verificação de origem, além do cookie. O endpoint de coleta `POST /api/agents/report` usa seu próprio token, sem sessão de navegador. O bloqueio de tentativas de login é local à instância Node (5 falhas por usuário/IP a cada 15 minutos); para ambiente público ou múltiplas instâncias, implemente rate limiting persistente no proxy/banco.
+
+**Novas rotas:** `POST /api/auth/login`, `GET /api/auth/me`, `POST /api/auth/logout`. Somente `GET /api/health` e `POST /api/auth/login` são públicos para usuários. Todas as outras rotas administrativas exigem sessão válida.
+
 ## API e limitações
 
-`GET /api/health` é público. Os demais endpoints exigem `Authorization: Bearer ADMIN_API_TOKEN`.
+`GET /api/health` é público. Os demais endpoints exigem sessão autenticada por cookie.
 
 - `GET/POST /api/servers`; `DELETE /api/servers/:id`
 - `GET/POST /api/applications`; `DELETE /api/applications/:id`
 - `GET /api/ports/reservations`; `POST /api/ports/suggest`
 - `POST /api/ports/reservations`; `DELETE /api/ports/reservations/:id`
 
-O token único é provisório: não publique o painel diretamente na internet. O gerenciador de portas consulta somente reservas cadastradas, não sockets reais dos hosts; a descoberta automática e autenticação por usuário continuam planejadas.
+O login usa usuários individuais, mas o painel ainda precisa de HTTPS e política operacional de segurança antes de exposição pública. O gerenciador de portas consulta somente reservas cadastradas, não sockets reais dos hosts; a descoberta automática e autenticação por usuário continuam planejadas.

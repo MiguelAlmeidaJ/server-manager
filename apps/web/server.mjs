@@ -38,7 +38,7 @@ const server = createServer(async (req, res) => {
       port: origin.port || 80,
       method: req.method,
       path: req.url,
-      headers: { ...req.headers, host: origin.host },
+      headers: { ...req.headers, host: req.headers.host || origin.host },
       timeout: 15_000,
     }, upstreamRes => {
       res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
