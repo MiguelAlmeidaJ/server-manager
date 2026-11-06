@@ -1,7 +1,7 @@
 import Fastify from 'fastify';
 import postgres from 'postgres';
 import { z, ZodError } from 'zod';
-import { timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual, randomBytes, createHash } from 'node:crypto';
 
 const secret = process.env.ADMIN_API_TOKEN;
 const url = process.env.DATABASE_URL;
@@ -24,7 +24,12 @@ await sql`CREATE TABLE IF NOT EXISTS port_reservations (
  created_at timestamptz DEFAULT now(), UNIQUE(server_id,port,protocol,bind_address)
 )`;
 
+await sql`CREATE TABLE IF NOT EXISTS server_agent_credentials (server_id uuid PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE, token_hash text NOT NULL, issued_at timestamptz NOT NULL DEFAULT now())`;
+await sql`CREATE TABLE IF NOT EXISTS server_scan_status (server_id uuid PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE, scanned_at timestamptz NOT NULL, hostname text, observation_count integer NOT NULL DEFAULT 0)`;
+await sql`CREATE TABLE IF NOT EXISTS observed_ports (server_id uuid NOT NULL REFERENCES servers(id) ON DELETE CASCADE, port integer NOT NULL CHECK(port BETWEEN 1 AND 65535), protocol text NOT NULL CHECK(protocol IN ('tcp','udp')), bind_address text NOT NULL, pid integer, process_name text, state text, scanned_at timestamptz NOT NULL, PRIMARY KEY(server_id,port,protocol,bind_address))`;
+
 app.addHook('onRequest', async (req,reply)=>{
+ if(req.url==='/api/agents/report' && req.method==='POST')return;
  if(req.url==='/api/health')return;
  const input=Buffer.from(req.headers.authorization?.replace(/^Bearer /,'')??'');
  const valid=Buffer.from(secret);
@@ -37,6 +42,7 @@ app.setErrorHandler((err,_req,reply)=>{
  app.log.error(err);return reply.code(500).send({error:'Internal server error'});
 });
 const id=z.string().uuid();
+const tokenHash=(value:string)=>createHash('sha256').update(value).digest('hex');
 const serverSchema=z.object({name:z.string().trim().min(1).max(120),ipAddress:z.string().trim().min(1).max(100),os:z.enum(['linux','windows','other']).default('linux'),environment:z.enum(['production','staging','development']).default('production')});
 const applicationSchema=z.object({name:z.string().trim().min(1).max(120),serverId:id,technology:z.string().max(120).optional(),domain:z.string().max(255).optional()});
 const reservationSchema=z.object({serverId:id,applicationId:id.optional(),port:z.number().int().min(1).max(65535),protocol:z.enum(['tcp','udp']).default('tcp'),bindAddress:z.string().min(1).max(100).default('0.0.0.0')});
@@ -74,9 +80,12 @@ app.post('/api/ports/suggest',async(req,reply)=>{
  const q=z.object({serverId:id,protocol:z.enum(['tcp','udp']).default('tcp'),bindAddress:z.string().default('0.0.0.0'),start:z.number().int().min(1).max(65535).default(3000),end:z.number().int().min(1).max(65535).default(3999)}).parse(req.body);
  if(q.end<q.start||q.end-q.start>5000)return reply.code(400).send({error:'Invalid range'});
  const used=await sql`SELECT port,bind_address FROM port_reservations WHERE server_id=${q.serverId} AND protocol=${q.protocol}`;
+ const status=await sql`SELECT scanned_at FROM server_scan_status WHERE server_id=${q.serverId}`;
+ const fresh=status.length && Date.now()-new Date(status[0].scanned_at).getTime()<5*60*1000;
+ const observed=fresh?await sql`SELECT port,bind_address FROM observed_ports WHERE server_id=${q.serverId} AND protocol=${q.protocol}`:[];
  let chosen:number|null=null;
- for(let port=q.start;port<=q.end;port++){if(!used.some(p=>p.port===port&&overlaps(p.bind_address,q.bindAddress))){chosen=port;break}}
- return {port:chosen,source:'reservations-only',warning:'Live sockets are not checked'};
+ for(let port=q.start;port<=q.end;port++){if(!used.some(p=>p.port===port&&overlaps(p.bind_address,q.bindAddress))&&!observed.some(p=>p.port===port&&overlaps(p.bind_address,q.bindAddress))){chosen=port;break}}
+ return {port:chosen,source:fresh?'reservations-and-fresh-snapshot':'reservations-only',scannedAt:status[0]?.scanned_at??null,warning:fresh?'Snapshot is not a guarantee of availability; recheck bind at launch':'No fresh scan (5 minute freshness window). Live sockets are not checked'};
 });
 app.put('/api/ports/reservations/:id',async(req,reply)=>{
  const {id:reservationId}=z.object({id}).parse(req.params);
@@ -113,4 +122,56 @@ app.post('/api/ports/reservations',async(req,reply)=>{
  return result && 'error' in result?reply.code(result.status).send({error:result.error}):result?reply.code(201).send(result):reply.code(409).send({error:'Port reservation conflicts'});
 });
 app.delete('/api/ports/reservations/:id',async(req,reply)=>{const {id:reservationId}=z.object({id}).parse(req.params);const rows=await sql`DELETE FROM port_reservations WHERE id=${reservationId} RETURNING id`;return rows.length?{deleted:true}:reply.code(404).send({error:'Not found'})});
+
+const agentRecord=z.object({
+  port:z.number().int().min(1).max(65535),
+  protocol:z.enum(['tcp','udp']),
+  bindAddress:z.string().min(1).max(100),
+  pid:z.number().int().min(0).nullable().optional(),
+  processName:z.string().max(255).nullable().optional(),
+  state:z.string().max(50).nullable().optional()
+});
+const reportSchema=z.object({serverId:id,hostname:z.string().max(255).optional(),ports:z.array(agentRecord).max(15000)});
+app.post('/api/servers/:id/agent-token',async(req,reply)=>{
+  const {id:serverId}=z.object({id}).parse(req.params);
+  const existing=await sql`SELECT id FROM servers WHERE id=${serverId}`;
+  if(!existing.length)return reply.code(404).send({error:'Server not found'});
+  const raw=randomBytes(32).toString('hex');
+  await sql`INSERT INTO server_agent_credentials (server_id,token_hash,issued_at) VALUES(${serverId},${tokenHash(raw)},now()) ON CONFLICT(server_id) DO UPDATE SET token_hash=excluded.token_hash,issued_at=now()`;
+  return {serverId,token:raw,warning:'Save this token securely. It is shown only once; regenerating revokes the old token.'};
+});
+app.delete('/api/servers/:id/agent-token',async(req)=>{
+  const {id:serverId}=z.object({id}).parse(req.params);
+  await sql`DELETE FROM server_agent_credentials WHERE server_id=${serverId}`;
+  return {revoked:true};
+});
+app.post('/api/agents/report',{bodyLimit:2*1024*1024},async(req,reply)=>{
+  const body=reportSchema.parse(req.body);
+  const raw=req.headers['x-agent-token'];
+  if(typeof raw!=='string'||raw.length!==64)return reply.code(401).send({error:'Agent unauthorized'});
+  const credential=await sql`SELECT token_hash FROM server_agent_credentials WHERE server_id=${body.serverId}`;
+  if(!credential.length)return reply.code(401).send({error:'Agent unauthorized'});
+  const presented=Buffer.from(tokenHash(raw),'hex');
+  const stored=Buffer.from(String(credential[0].token_hash),'hex');
+  if(stored.length!==presented.length||!timingSafeEqual(stored,presented))return reply.code(401).send({error:'Agent unauthorized'});
+  // Deduplicate observations before insertion. No partial snapshot is committed.
+  const unique=new Map<string,z.infer<typeof agentRecord>>();
+  for(const record of body.ports)unique.set([record.port,record.protocol,record.bindAddress].join('|'),record);
+  const collected=[...unique.values()];
+  await sql.begin(async tx=>{
+    await tx`SELECT pg_advisory_xact_lock(hashtext(${body.serverId+':scan'}))`;
+    await tx`DELETE FROM observed_ports WHERE server_id=${body.serverId}`;
+    for(const rec of collected){
+      await tx`INSERT INTO observed_ports(server_id,port,protocol,bind_address,pid,process_name,state,scanned_at) VALUES(${body.serverId},${rec.port},${rec.protocol},${rec.bindAddress},${rec.pid??null},${rec.processName??null},${rec.state??null},now())`;
+    }
+    await tx`INSERT INTO server_scan_status(server_id,scanned_at,hostname,observation_count) VALUES(${body.serverId},now(),${body.hostname??null},${collected.length}) ON CONFLICT(server_id) DO UPDATE SET scanned_at=excluded.scanned_at,hostname=excluded.hostname,observation_count=excluded.observation_count`;
+  });
+  return {received:collected.length};
+});
+app.get('/api/ports/observed',async(req)=>{
+  const query=z.object({serverId:id.optional()}).parse(req.query);
+  return sql`SELECT o.server_id AS "serverId",o.port,o.protocol,o.bind_address AS "bindAddress",o.pid,o.process_name AS "processName",o.state,o.scanned_at AS "scannedAt" FROM observed_ports o WHERE (${query.serverId??null}::uuid IS NULL OR o.server_id=${query.serverId??null}::uuid) ORDER BY o.port LIMIT 20000`;
+});
+app.get('/api/servers/scan-status',async()=>sql`SELECT server_id AS "serverId",scanned_at AS "scannedAt",hostname,observation_count AS "observationCount" FROM server_scan_status ORDER BY scanned_at DESC`);
+
 await app.listen({host:process.env.HOST??'127.0.0.1',port:Number(process.env.PORT??3333)});
