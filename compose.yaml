@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-servermap}
+      POSTGRES_USER: ${POSTGRES_USER:-servermap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Configure POSTGRES_PASSWORD}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-servermap}"]
+      interval: 5s
+      retries: 10
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-servermap}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-servermap}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:?Configure ADMIN_API_TOKEN}
+      HOST: 0.0.0.0
+    depends_on:
+      postgres: { condition: service_healthy }
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    ports: ["127.0.0.1:8080:80"]
+    depends_on: [api]
+volumes:
+  pgdata:
