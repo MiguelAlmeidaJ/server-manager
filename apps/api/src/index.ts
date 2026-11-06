@@ -32,8 +32,8 @@ app.addHook('onRequest', async (req,reply)=>{
 });
 app.setErrorHandler((err,_req,reply)=>{
  if(err instanceof ZodError)return reply.code(400).send({error:'Validation failed',details:err.flatten()});
- if('code' in err && err.code==='23503')return reply.code(400).send({error:'Referenced item not found'});
- if('code' in err && err.code==='23505')return reply.code(409).send({error:'Already exists'});
+ if(err && typeof err === 'object' && 'code' in err && err.code==='23503')return reply.code(400).send({error:'Referenced item not found'});
+ if(err && typeof err === 'object' && 'code' in err && err.code==='23505')return reply.code(409).send({error:'Already exists'});
  app.log.error(err);return reply.code(500).send({error:'Internal server error'});
 });
 const id=z.string().uuid();

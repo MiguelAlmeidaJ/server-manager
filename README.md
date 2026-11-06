@@ -66,6 +66,28 @@ pm2 save
 
 Para boot automático: `pm2 startup`, execute a instrução gerada e depois `pm2 save`. Recomenda-se executar PM2 com um usuário dedicado sem root.
 
+## Windows / PowerShell
+
+No Windows, **não execute `corepack enable` sem permissões administrativas**: ele pode falhar com `EPERM` ao tentar escrever em `C:\\Program Files\\nodejs`. Se `pnpm --version` já funcionar, pule esse comando.
+
+```powershell
+git checkout beta
+git pull origin beta
+# Se já existir um .env configurado, preserve-o.
+docker compose up -d postgres
+pnpm install
+pnpm rebuild esbuild
+pnpm build
+pm2 startOrReload ecosystem.config.cjs --update-env
+pm2 save
+pm2 status
+Invoke-RestMethod http://127.0.0.1:3333/api/health
+```
+
+Se o PM2 já estiver ativo, prefira `pm2 restart ecosystem.config.cjs --update-env`. Se o web build falhar com erro de esbuild, o `pnpm rebuild esbuild` pode reparar a instalação; em instalações novas, esbuild está autorizado no `pnpm.onlyBuiltDependencies`.
+
+Verifique `pm2 logs servermap-api --lines 50` e `pm2 logs servermap-web --lines 50` se o status estiver online mas o endpoint falhar. O PM2 em estado `online` **não** substitui build bem-sucedido e teste HTTP.
+
 ## API e limitações
 
 `GET /api/health` é público. Os demais endpoints exigem `Authorization: Bearer ADMIN_API_TOKEN`.
