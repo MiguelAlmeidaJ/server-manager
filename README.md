@@ -122,6 +122,14 @@ A tela **Portas** mostra as observações, processo, PID, endereço e data de co
 
 Novas rotas administrativas: `POST /api/servers/:id/agent-token`, `DELETE /api/servers/:id/agent-token`, `GET /api/ports/observed` e `GET /api/servers/scan-status`. O coletor envia para `POST /api/agents/report` usando `X-Agent-Token`.
 
+## Agente instalável `devops_manager`
+
+O ServerMap agora possui um agente leve em Go, instalável como **Windows Service** ou serviço **systemd Linux** chamado `devops_manager`. Ele coleta portas TCP/UDP periodicamente e envia snapshots para `POST /api/agents/report` com token exclusivo por servidor. Não utiliza Node.js, PM2 ou Docker nos servidores monitorados.
+
+Confira as instruções de build, segurança, instalação, atualização e remoção em [agents/collector/README.md](agents/collector/README.md). Os instaladores ficam em `agents/collector/install/windows/install.ps1` e `agents/collector/install/linux/install.sh`. O GitHub Actions compila os executáveis para Windows e Linux amd64.
+
+O PostgreSQL **continua no Docker** do ServerMap; web e API **continuam no PM2 do host**. O agente é um serviço separado para cada servidor monitorado.
+
 ## API e limitações
 
 `GET /api/health` é público. Os demais endpoints exigem `Authorization: Bearer ADMIN_API_TOKEN`.

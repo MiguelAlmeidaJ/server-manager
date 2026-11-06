@@ -1,0 +1,6 @@
+{
+  "apiUrl": "https://servermap.example.com",
+  "serverId": "REPLACE-WITH-UUID-FROM-SERVERMAP",
+  "token": "REPLACE-WITH-AGENT-TOKEN",
+  "intervalSeconds": 60
+}

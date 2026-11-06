@@ -1,0 +1,37 @@
+name: Build DevOps Manager Agent
+on:
+  push:
+    branches: [beta]
+    paths:
+      - 'agents/collector/**'
+      - '.github/workflows/agent-build.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agents/collector
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agents/collector/go.mod
+      - name: Test
+        run: go test ./...
+      - name: Build Linux amd64
+        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o devops_manager-linux-amd64 ./cmd/devops_manager
+      - name: Build Windows amd64
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o devops_manager-windows-amd64.exe ./cmd/devops_manager
+      - name: Upload Linux executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: devops_manager-linux-amd64
+          path: agents/collector/devops_manager-linux-amd64
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: devops_manager-windows-amd64
+          path: agents/collector/devops_manager-windows-amd64.exe
